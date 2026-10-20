@@ -1,0 +1,180 @@
+# Payyar data platform - whole stack with one command:  docker compose up -d --build
+#
+#   postgres ──(pgoutput / logical replication)──> debezium connect ──> kafka
+#        ▲                                                                │
+#   simulator (changes)                         ClickHouse Kafka engine ◄─┘
+#      raw ──MV──> stg ──MV / refreshable MV (every minute)──> mart ──> Metabase
+#   All transformations, scheduling and data-quality checks run inside ClickHouse.
+name: payyar
+
+x-tools: &tools
+  build:
+    context: ./tools
+    args:
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+  image: payyar-tools:local
+  env_file: .env
+  environment:
+    PG_HOST: postgres
+    CH_HOST: clickhouse
+    MB_URL: http://metabase:3000
+    CONNECT_URL: http://connect:8083
+
+services:
+  # ------------------------------------------------------------------ source (T0)
+  postgres:
+    image: postgres:16.10
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${PG_DB}
+      POSTGRES_USER: ${PG_ADMIN_USER}
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD}
+    command: >
+      postgres -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
+               -c max_slot_wal_keep_size=4GB -c shared_buffers=512MB -c work_mem=32MB
+               -c maintenance_work_mem=256MB -c max_wal_size=2GB -c checkpoint_timeout=15min
+               -c max_parallel_workers_per_gather=2 -c track_io_timing=on
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./source/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports: ["127.0.0.1:15432:5432"]
+    shm_size: 1g          # parallel VACUUM / queries need more than Docker's 64 MB /dev/shm
+    healthcheck:
+      # TCP is only opened after the init/seed scripts have finished
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB} && psql -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc 'SELECT 1 FROM core.transactions LIMIT 1' | grep -q 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 600s
+    mem_limit: 1536m
+    restart: unless-stopped
+
+  simulator:
+    <<: *tools
+    command: ["python", "simulator.py"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    mem_limit: 256m
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ CDC (T1)
+  kafka:
+    image: apache/kafka:4.1.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+      CLUSTER_ID: gKqg7Sv3TM-2sQFlH6Unew
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 20s
+      retries: 30
+    mem_limit: 1g
+    restart: unless-stopped
+
+  connect:
+    image: quay.io/debezium/connect:3.2.3.Final
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: payyar-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_FLUSH_INTERVAL_MS: 10000
+      CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
+      HEAP_OPTS: -Xms512m -Xmx768m
+    ports: ["127.0.0.1:8083:8083"]
+    depends_on:
+      kafka: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    mem_limit: 1280m
+    restart: unless-stopped
+
+  cdc-init:
+    <<: *tools
+    command: ["python", "register_connector.py"]
+    depends_on:
+      connect: {condition: service_started}
+    restart: on-failure
+
+  # ------------------------------------------------------------------ analytics (T2-T5)
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    env_file: .env
+    environment:
+      CLICKHOUSE_USER: ${CH_ADMIN_USER}
+      CLICKHOUSE_PASSWORD: ${CH_ADMIN_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      PG_HOST: postgres
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - ./clickhouse/config.d/payyar.xml:/etc/clickhouse-server/config.d/payyar.xml:ro
+      - ./clickhouse/initdb:/docker-entrypoint-initdb.d:ro
+      - ./clickhouse/sql:/sql:ro
+      - ./clickhouse/scripts:/scripts:ro
+    ports: ["127.0.0.1:18123:8123"]
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user $${CLICKHOUSE_USER} --password $${CLICKHOUSE_PASSWORD} -q \"SELECT throwIf(count() = 0) FROM system.tables WHERE database = 'raw' AND name = 'mv_dead_letter_merchants'\""]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    mem_limit: 3584m
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ BI
+  metabase:
+    image: metabase/metabase:v0.58.36
+    environment:
+      MB_DB_FILE: /metabase-data/metabase.db
+      JAVA_OPTS: -Xmx1g
+      MB_ANON_TRACKING_ENABLED: "false"
+      MB_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - mbdata:/metabase-data
+    ports: ["127.0.0.1:3000:3000"]
+    mem_limit: 1800m
+    restart: unless-stopped
+
+  metabase-setup:
+    <<: *tools
+    command: ["python", "metabase_setup.py"]
+    volumes:
+      - ./docs/results:/results
+    depends_on:
+      metabase: {condition: service_started}
+      clickhouse: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    restart: on-failure
+
+  # on-demand tooling: docker compose run --rm ops python <script>.py
+  ops:
+    <<: *tools
+    profiles: ["tools"]
+    volumes:
+      - ./docs/results:/results
+
+volumes:
+  pgdata:
+  chdata:
+  mbdata:
